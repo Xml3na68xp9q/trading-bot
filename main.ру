@@ -1,0 +1,138 @@
+import ccxt
+import pandas as pd
+import ta
+import time
+import telebot
+
+# Telegram настройки
+TELEGRAM_BOT_TOKEN = '7626027662:AAEkRUsg5Uja49S3TYWljI0TRWEWMj2HfKE'
+CHAT_ID = '427598229'
+bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
+
+def send_telegram_message(msg):
+    bot.send_message(CHAT_ID, msg)
+
+exchange = ccxt.kucoinfutures({
+    'enableRateLimit': True,
+    'timeout': 5000
+})
+
+symbol = 'SOL/USDT:USDT'
+last_signal = None
+last_price = None
+last_time = time.time()
+
+def fetch_data(symbol, timeframe='15m', limit=100):
+    try:
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+    except Exception as e:
+        send_telegram_message(f"❌ Ошибка получения OHLCV: {str(e)}")
+        return None
+
+    df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
+    df['time'] = pd.to_datetime(df['time'], unit='ms')
+
+    try:
+        df['EMA20'] = ta.trend.ema_indicator(df['close'], window=20)
+        df['EMA50'] = ta.trend.ema_indicator(df['close'], window=50)
+        df['RSI14'] = ta.momentum.rsi(df['close'], window=14)
+        df['ADX'] = ta.trend.adx(df['high'], df['low'], df['close'], window=14)
+        df['DI+'] = ta.trend.adx_pos(df['high'], df['low'], df['close'], window=14)
+        df['DI-'] = ta.trend.adx_neg(df['high'], df['low'], df['close'], window=14)
+        df['MACD'] = ta.trend.macd(df['close'])
+        df['MACD_Signal'] = ta.trend.macd_signal(df['close'])
+        df['Volume Spike'] = df['volume'] > df['volume'].rolling(window=10).mean() * 1.5
+        df['ATR'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'], window=14)
+        df.dropna(inplace=True)
+    except Exception as e:
+        send_telegram_message(f"❌ Ошибка расчёта индикаторов: {str(e)}")
+        return None
+
+    return df
+
+def analyze_order_book(symbol):
+    try:
+        book = exchange.fetch_order_book(symbol, limit=100)
+        bids = sum([b[1] for b in book['bids']])
+        asks = sum([a[1] for a in book['asks']])
+        delta = bids - asks
+        return bids, asks, delta
+    except Exception as e:
+        send_telegram_message(f"❌ Ошибка стакана: {str(e)}")
+        return 0, 0, 0
+
+def analyze_market(df):
+    last_close = df['close'].iloc[-1]
+    atr = df['ATR'].iloc[-1]
+    up_trend = df['DI+'].iloc[-1] > df['DI-'].iloc[-1] and df['EMA20'].iloc[-1] > df['EMA50'].iloc[-1]
+    down_trend = df['DI+'].iloc[-1] < df['DI-'].iloc[-1] and df['EMA20'].iloc[-1] < df['EMA50'].iloc[-1]
+    rsi = df['RSI14'].iloc[-1]
+    adx = df['ADX'].iloc[-1]
+    macd = df['MACD'].iloc[-1]
+    macd_sig = df['MACD_Signal'].iloc[-1]
+    spike = df['Volume Spike'].iloc[-1]
+    _, _, delta = analyze_order_book(symbol)
+
+    signal = "Нет сигнала"
+    if up_trend and rsi > 30 and adx > 20 and delta > 200 and macd > macd_sig and spike:
+        signal = "STRONG LONG" if rsi < 70 else "WEAK LONG"
+    elif down_trend and rsi < 70 and adx > 20 and delta < -200 and macd < macd_sig and spike:
+        signal = "STRONG SHORT" if rsi > 30 else "WEAK SHORT"
+
+    if signal.startswith("LONG"):
+        sl = last_close - (1.5 * atr)
+        tp1 = last_close + (2.5 * atr)
+        tp2 = last_close + (3.5 * atr)
+    elif signal.startswith("SHORT"):
+        sl = last_close + (1.5 * atr)
+        tp1 = last_close - (2.5 * atr)
+        tp2 = last_close - (3.5 * atr)
+    else:
+        sl = tp1 = tp2 = None
+
+    return signal, last_close, sl, tp1, tp2
+
+while True:
+    try:
+        df = fetch_data(symbol)
+        if df is None:
+            time.sleep(5)
+            continue
+
+        signal, price, sl, tp1, tp2 = analyze_market(df)
+
+        if signal != last_signal or abs(price - last_price) > 0.3:
+            now = time.time()
+            if now - last_time > 180 and signal != "Нет сигнала":
+                if all(v is not None for v in [sl, tp1, tp2]):
+                    send_telegram_message(
+                        f"🚨 Новый сигнал! {signal} | Цена: {price:.2f}\n"
+                        f"🛑 SL: {sl:.2f} | 🎯 TP1: {tp1:.2f} | 🎯 TP2: {tp2:.2f}"
+                    )
+                else:
+                    send_telegram_message(f"🚨 Новый сигнал! {signal}, но уровни SL/TP не рассчитаны.")
+                last_signal = signal
+                last_price = price
+                last_time = now
+
+        if all(v is not None for v in [price, sl, tp1, tp2]):
+            if signal.startswith("LONG"):
+                if price <= sl:
+                    send_telegram_message(f"🔻 SL достигнут: {sl:.2f}")
+                elif price >= tp2:
+                    send_telegram_message(f"🏆 TP2 достигнут: {tp2:.2f}")
+                elif price >= tp1:
+                    send_telegram_message(f"✅ TP1 достигнут: {tp1:.2f}")
+            elif signal.startswith("SHORT"):
+                if price >= sl:
+                    send_telegram_message(f"🔻 SL достигнут: {sl:.2f}")
+                elif price <= tp2:
+                    send_telegram_message(f"🏆 TP2 достигнут: {tp2:.2f}")
+                elif price <= tp1:
+                    send_telegram_message(f"✅ TP1 достигнут: {tp1:.2f}")
+
+    except Exception as e:
+        send_telegram_message(f"❌ Главная ошибка: {str(e)}")
+        time.sleep(5)
+    
+    time.sleep(1)
